@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: UNLICENSED
 pragma solidity ^0.8.27;
 
-// Импортируем интерфейс для работы с ERC20 токенами
-import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/utils/Strings.sol";
+import "@openzeppelin/contracts/utils/Counters.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 
 // Контракт GybernatyUnitManager для управления уровнями пользователей
-contract GybernatyUnitManager {
+contract GybernatyUnitManager is ReentrancyGuard {
     // Структура для хранения информации о пользователях
     struct User {
         // Адрес пользователя
@@ -20,8 +21,10 @@ contract GybernatyUnitManager {
         bool markedDown;
         // Текущий уровень пользователя
         uint32 level;
-        // Флаг, указывающий, ожидает ли пользователь подтверждения создания
-        bool pendingCreation;
+        // Последнее время вывода токенов Gbr
+        uint256 lastWithdrawTime;
+        // Счетчик выводов токенов Gbr в текущем месяце
+        uint256 withdrawCount;
     }
 
     // Максимальный уровень пользователя (константа)
@@ -29,7 +32,7 @@ contract GybernatyUnitManager {
     // Количество Gbr токенов, необходимое для вступления в категорию Gybernaty
     uint256 public constant GbrTokenAmount = 1_000_000_000_000;
     // Адрес контракта Gbr токенов
-    IERC20 public constant GbrToken = IERC20(0xA970cAE9Fa1D7Cca913b7C19DF45BF33d55384A9);
+    address public constant GbrTokenAddress = 0xA970cAE9Fa1D7Cca913b7C19DF45BF33d55384A9;
     // Количество BNB, необходимое для вступления в категорию Gybernaty
     uint256 public constant BnbAmount = 1000 ether;
 
@@ -44,8 +47,8 @@ contract GybernatyUnitManager {
     event UserLevelUp(address userAddress);
     event UserLevelDown(address userAddress);
     event GybernatyJoined(address gybernatyAddress);
-    event UserCreationRequested(address userAddress);
-    event UserCreationConfirmed(address userAddress);
+    event TokensWithdrawn(address userAddress, uint256 amount);
+    event UserCreated(address userAddress);
 
     // Ошибки контракта
     error OnlyGybernaty();
@@ -56,7 +59,8 @@ contract GybernatyUnitManager {
     error MinLevel();
     error MaxLevel();
     error InsufficientFunds();
-    error InsufficientApprovals();
+    error WithdrawLimitExceeded();
+    error InsufficientGbrTokens();
 
     // Модификатор для проверки, является ли вызывающий адрес членом категории Gybernaty
     modifier onlyGybernaty() {
@@ -73,11 +77,11 @@ contract GybernatyUnitManager {
 
     /**
      * Функция для вступления в категорию Gybernaty
-     * @dev Адрес, отправивший достаточное количество Gbr токенов или BNB, становится членом Gybernaty
+     * @dev Адрес, отправивший достаточное количество Gbr токенов или BNB, становится членом Gybernaty.
      */
     function joinGybernaty() public payable {
         // Проверяем, отправлено ли достаточное количество Gbr токенов или BNB
-        if (msg.value < BnbAmount && GbrToken.balanceOf(msg.sender) < GbrTokenAmount) {
+        if (msg.value < BnbAmount && msg.value < GbrTokenAmount) {
             revert InsufficientFunds();
         }
 
@@ -89,48 +93,17 @@ contract GybernatyUnitManager {
     }
 
     /**
-     * Функция для заявления данных для создания пользователя
+     * Функция для создания нового пользователя
+     * @param userAddress Адрес пользователя
+     * @param level Начальный уровень пользователя
      * @param name Имя пользователя (опциональное)
      * @param link Ссылка пользователя (опциональное)
+     * @dev Только члены Gybernaty могут создавать новых пользователей
      */
-    function requestUserCreation(string memory name, string memory link) public {
-        address userAddress = msg.sender;
-
+    function createUser(address userAddress, uint32 level, string memory name, string memory link) public onlyGybernaty {
         // Проверяем, существует ли пользователь
         if (users[userAddress].userAddress != address(0)) {
             revert UserExists();
-        }
-
-        // Создаем нового пользователя с пустым уровнем и отметкой ожидания подтверждения
-        User memory user = User(
-            userAddress,
-            name,
-            link,
-            false,
-            false,
-            0,
-            true
-        );
-
-        // Добавляем пользователя в маппинг
-        users[userAddress] = user;
-
-        // Вызываем событие о заявке на создание пользователя
-        emit UserCreationRequested(userAddress);
-    }
-
-    /**
-     * Функция для подтверждения создания пользователя
-     * @param userAddress Адрес пользователя
-     * @param level Начальный уровень пользователя
-     * @param approver1 Адрес первого подтверждающего
-     * @param approver2 Адрес второго подтверждающего (если требуется)
-     * @param approver3 Адрес третьего подтверждающего (если требуется)
-     */
-    function confirmUserCreation(address userAddress, uint32 level, address approver1, address approver2, address approver3) public onlyGybernaty {
-        // Проверяем, существует ли пользователь
-        if (users[userAddress].userAddress == address(0)) {
-            revert UserNotFound();
         }
 
         // Проверяем, является ли указанный уровень действительным
@@ -138,33 +111,23 @@ contract GybernatyUnitManager {
             revert LevelInvalid();
         }
 
-        // Проверяем, ожидает ли пользователь подтверждения создания
-        if (!users[userAddress].pendingCreation) {
-            revert UserNotFound();
-        }
+        // Создаем нового пользователя
+        User memory user = User(
+            userAddress,
+            name,
+            link,
+            false,
+            false,
+            level,
+            0,
+            0
+        );
 
-        // Подтверждение создания пользователя
-        if (gybernaties[approver1] && (level == 1 || level == 2)) {
-            // Подтверждение одного Gybernaty для уровней 1 и 2
-            users[userAddress].level = level;
-            users[userAddress].pendingCreation = false;
-            emit UserCreationConfirmed(userAddress);
-            emit UserLevelUp(userAddress);
-        } else if (gybernaties[approver1] && gybernaties[approver2] && (level == 3)) {
-            // Подтверждение двух Gybernaty для уровня 3
-            users[userAddress].level = level;
-            users[userAddress].pendingCreation = false;
-            emit UserCreationConfirmed(userAddress);
-            emit UserLevelUp(userAddress);
-        } else if (gybernaties[approver1] && gybernaties[approver2] && gybernaties[approver3] && (level == 4)) {
-            // Подтверждение трех Gybernaty для уровня 4
-            users[userAddress].level = level;
-            users[userAddress].pendingCreation = false;
-            emit UserCreationConfirmed(userAddress);
-            emit UserLevelUp(userAddress);
-        } else {
-            revert InsufficientApprovals();
-        }
+        // Добавляем пользователя в маппинг
+        users[userAddress] = user;
+
+        // Вызываем событие о создании пользователя
+        emit UserCreated(userAddress);
     }
 
     /**
@@ -176,7 +139,7 @@ contract GybernatyUnitManager {
 
         // Проверяем, существует ли пользователь
         if (users[userAddress].userAddress == address(0)) {
-            revert UserExists(); // Пользователь уже существует, поэтому не может отмечать себя повторно
+            revert UserNotFound();
         }
 
         // Проверяем, имеет ли пользователь максимальный уровень
@@ -194,7 +157,7 @@ contract GybernatyUnitManager {
     /**
      * Функция для отметки пользователя для понижения уровня
      * @param userAddress Адрес пользователя
-     * @dev Только члены Gybernaty могут отметки пользователей для понижения уровня
+     * @dev Только члены Gybernaty могут отмечать пользователей для понижения уровня
      */
     function userMarkDown(address userAddress) public onlyGybernaty {
         // Проверяем, существует ли пользователь
@@ -233,7 +196,7 @@ contract GybernatyUnitManager {
         // Повышаем уровень пользователя
         users[userAddress].level += 1;
 
-        // Сброс отметок пользователя
+        // Сброс отмечек пользователя
         users[userAddress].markedUp = false;
         users[userAddress].markedDown = false;
 
@@ -260,7 +223,7 @@ contract GybernatyUnitManager {
         // Понижаем уровень пользователя
         users[userAddress].level -= 1;
 
-        // Сброс отметок пользователя
+        // Сброс отмечек пользователя
         users[userAddress].markedUp = false;
         users[userAddress].markedDown = false;
 
@@ -269,55 +232,52 @@ contract GybernatyUnitManager {
     }
 
     /**
-     * Функция для рассылки токенов Gbr пользователям
-     * @dev Вызывается два раза в месяц для рассылки токенов
-     */
-    function distributeGbrTokens() public {
-        // Определяем количество токенов для каждого уровня
-        uint256[] memory tokenAmounts = [10_000_000, 100_000_000, 1_000_000_000, 10_000_000_000];
-
-        // Проходим по всем пользователям и отправляем токены
-        for (uint256 i = 1; i <= maxLevel; i++) {
-            for (address userAddress  getLevelUsers(i)) {
-                uint256 amount = tokenAmounts[i - 1];
-                GbrToken.transfer(userAddress, amount);
-            }
-        }
-    }
-
-    /**
-     * Функция для получения пользователей определенного уровня
-     * @param level Уровень пользователей
-     * @return Массив адресов пользователей
-     */
-    function getLevelUsers(uint32 level) public view returns (address[] memory) {
-        uint256 count = 0;
-        for (uint256 i = 0; i < users.length; i++) {
-            if (users[users[i].userAddress].level == level) {
-                count++;
-            }
-        }
-
-        address[] memory levelUsers = new address[](count);
-        uint256 index = 0;
-        for (uint256 i = 0; i < users.length; i++) {
-            if (users[users[i].userAddress].level == level) {
-                levelUsers[index] = users[i].userAddress;
-                index++;
-            }
-        }
-
-        return levelUsers;
-    }
-
-    /**
-     * Функция для вывода Gbr токенов с контракта
+     * Функция для вывода токенов Gbr
      * @param amount Количество Gbr токенов для вывода
-     * @dev Только члены Gybernaty могут выводить Gbr токены
+     * @dev Только пользователи могут выводить токены
      */
-    function withdrawGbrTokens(uint256 amount) public onlyGybernaty {
+    function withdrawGbrTokens(uint256 amount) public nonReentrant {
+        address userAddress = msg.sender;
+        User storage user = users[userAddress];
+
+        // Проверяем, существует ли пользователь
+        if (user.userAddress == address(0)) {
+            revert UserNotFound();
+        }
+
+        // Проверяем, не превышен ли лимит выводов в текущем месяце
+        uint256 currentMonth = block.timestamp / 2629743; // Приближенное количество секунд в месяце
+        if (user.lastWithdrawTime / 2629743 != currentMonth || user.withdrawCount >= 2) {
+            revert WithdrawLimitExceeded();
+        }
+
+        // Проверяем, имеет ли пользователь достаточно токенов Gbr
+        if (amount > getMaxWithdrawAmount(user)) {
+            revert InsufficientGbrTokens();
+        }
+
+        // Обновляем счетчик выводов токенов и время последнего вывода
+        user.withdrawCount += 1;
+        user.lastWithdrawTime = block.timestamp;
+
         // Выводим Gbr токены на адрес вызывающего
-        GbrToken.transfer(msg.sender, amount);
+        payable(userAddress).transfer(amount);
+
+        // Вызываем событие о выводе токенов
+        emit TokensWithdrawn(userAddress, amount);
+    }
+
+    /**
+     * Функция для получения максимального количества токенов, которое пользователь может вывести
+     * @param user Адрес пользователя
+     * @return Максимальное количество токенов, которое пользователь может вывести
+     */
+    function getMaxWithdrawAmount(User memory user) public pure returns (uint256) {
+        if (user.level == 1) return 1000000000000;
+        if (user.level == 2) return 100000000000000;
+        if (user.level == 3) return 1000000000000000;
+        if (user.level == 4) return 10000000000000000;
+        return 0;
     }
 
     /**
@@ -326,7 +286,7 @@ contract GybernatyUnitManager {
      */
     receive() external payable {
         // Проверяем, является ли отправитель адресом контракта Gbr токенов
-        if (msg.sender != address(GbrToken)) {
+        if (msg.sender != GbrTokenAddress) {
             revert(); // Отклонить любые другие токены
         }
     }
